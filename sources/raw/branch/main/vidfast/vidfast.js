@@ -379,89 +379,101 @@ async function ilovefeet(imdbId, isSeries = false, season = null, episode = null
     const pageResponse = await fetchv2(baseUrl, headers);
     const pageText = await pageResponse.text();
 
-    // ======================== PRIMARY METHOD (API) ========================
-    let match = null;
-    const patterns = [
-        /\\"en\\":\s*\\"([^"\\]+)\\"/,
-        /"en"\s*:\s*"([^"]+)"/,
-        /'en'\s*:\s*'([^']+)'/,
-        /["']en["']\s*:\s*["']([^"']+)["']/,
-        /\\"en\\":\s*\\"([^"]+?)\\"/,
-        /\\"en\\":\s*"(.*?)"/,
-        /data-video\s*=\s*["']([^"']+)["']/,
-        /"encryptedData"\s*:\s*"([^"]+)"/,
-    ];
-
-    for (const pattern of patterns) {
-        match = pageText.match(pattern);
-        if (match) break;
-    }
+    let match = pageText.match(/"en":"([^"]+)"/) ||
+        pageText.match(/'en':'([^']+)'/);
 
     if (!match) {
-        console.error("Could not find encrypted data. Page text snippet: " + pageText.substring(0, 500));
         throw new Error('Could not find data in page');
     }
     const rawData = match[1];
 
-    // Try the external decryption API
-    let apiData;
-    try {
-        const apiResponse = await soraFetch(`https://enc-dec.app/api/enc-vidfast?text=${encodeURIComponent(rawData)}`);
-        if (!apiResponse || !apiResponse.ok) {
-            throw new Error(`API response not ok: ${apiResponse?.status}`);
-        }
-        apiData = await apiResponse.json();
-        if (apiData.status !== 200 || !apiData.result) {
-            throw new Error(`API returned status ${apiData.status}, result missing`);
-        }
-    } catch (apiError) {
-        console.error("enc-dec.app API failed, falling back to direct scraping:", apiError.message);
-        // ======================== FALLBACK: DIRECT SCRAPING ========================
-        return await scrapeStreamUrlDirect(pageText, baseUrl, headers, preferredFormat);
+    // 1. Use the enc-dec.app API to get server and stream URLs
+    const apiResponse = await soraFetch(`https://enc-dec.app/api/enc-vidfast?text=${encodeURIComponent(rawData)}`);
+    const apiData = await apiResponse.json();
+
+    if (apiData.status !== 200 || !apiData.result) {
+        throw new Error('Failed to decrypt data via enc-dec.app API');
     }
 
-    // Primary API succeeded – process normally
     const apiServers = apiData.result.servers;
-    const serversResponse = await fetchv2(apiServers, headers);
-    const serverList = await serversResponse.json();
+    const streamBase = apiData.result.stream;
+    const token = apiData.result.token;
+
+    // 2. Add CSRF token to headers if present
+    if (token) {
+        headers["X-CSRF-Token"] = token;
+    }
+
+    // 3. Fetch servers list (POST request)
+    const serversEncryptedResponse = await soraFetch(apiServers, {
+        method: 'POST',
+        headers: headers
+    });
+    const serversEncryptedText = await serversEncryptedResponse.text();
+
+    // 4. Decrypt servers list
+    const decServersResponse = await soraFetch('https://enc-dec.app/api/dec-vidfast', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: serversEncryptedText })
+    });
+    const decServersData = await decServersResponse.json();
+
+    if (decServersData.status !== 200 || !decServersData.result) {
+        throw new Error('Failed to decrypt servers list');
+    }
+
+    const serverList = decServersData.result;
 
     if (!serverList || serverList.length === 0) {
         throw new Error('No servers available');
     }
-
-    const streamBase = apiData.result.stream;
 
     const testServer = async (serverObj, index) => {
         const server = serverObj.data;
         const apiStream = streamBase + '/' + server;
 
         try {
-            const streamResponse = await fetchv2(apiStream, headers);
-            if (streamResponse.status !== 200) {
-                throw new Error(`Server ${index} returned status ${streamResponse.status}`);
+            // 5. Fetch stream (POST request)
+            const streamEncryptedResponse = await soraFetch(apiStream, {
+                method: 'POST',
+                headers: headers
+            });
+            const streamEncryptedText = await streamEncryptedResponse.text();
+
+            // 6. Decrypt stream
+            const decStreamResponse = await soraFetch('https://enc-dec.app/api/dec-vidfast', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: streamEncryptedText })
+            });
+            const decStreamData = await decStreamResponse.json();
+
+            if (decStreamData.status !== 200 || !decStreamData.result) {
+                throw new Error(`Server ${index} failed to decrypt`);
             }
-            const streamText = await streamResponse.text();
-            let data;
-            try {
-                data = JSON.parse(streamText);
-            } catch (e) {
-                throw new Error(`Server ${index} returned invalid JSON`);
-            }
+
+            let data = decStreamData.result;
+
             if (!data.url) {
                 throw new Error(`Server ${index} has no URL`);
             }
 
             const format = data.url.includes('.m3u8') ? 'm3u8' : data.url.includes('.mpd') ? 'mpd' : 'unknown';
+
             const hasEnglishSubs = data.tracks && Array.isArray(data.tracks) &&
                 data.tracks.some(track => track.label && track.label.toLowerCase().includes('english') && track.file);
 
             if (preferredFormat === 'm3u8' && format === 'm3u8' && hasEnglishSubs) {
                 return { index, server, success: true, format, data, preferred: true, hasSubtitles: true };
             }
+
             if (preferredFormat === 'm3u8' && format === 'm3u8') {
                 return { index, server, success: true, format, data, preferred: true, hasSubtitles: false };
             }
+
             return { index, server, success: true, format, data, preferred: false, hasSubtitles: hasEnglishSubs };
+
         } catch (error) {
             throw new Error(`Server ${index} failed: ${error.message}`);
         }
@@ -482,6 +494,8 @@ async function ilovefeet(imdbId, isSeries = false, season = null, episode = null
                 } catch (error) {
                     console.log('vFast server failed: ' + error.message);
                 }
+            } else {
+                console.log('vFast server not found in server list');
             }
 
             const raceForSubtitles = new Promise((resolve, reject) => {
@@ -491,14 +505,17 @@ async function ilovefeet(imdbId, isSeries = false, season = null, episode = null
                 serverPromises.forEach(promise => {
                     promise.then(result => {
                         completedCount++;
+
                         if (result.hasSubtitles) {
                             console.log(`Found server ${result.index} with subtitles, stopping other requests`);
                             resolve(result);
                             return;
                         }
+
                         if (!firstWorkingServer && result.format === 'm3u8') {
                             firstWorkingServer = result;
                         }
+
                         if (completedCount === serverPromises.length) {
                             if (firstWorkingServer) {
                                 console.log(`No servers with subtitles found, using fallback server ${firstWorkingServer.index}`);
@@ -509,6 +526,7 @@ async function ilovefeet(imdbId, isSeries = false, season = null, episode = null
                         }
                     }).catch(() => {
                         completedCount++;
+
                         if (completedCount === serverPromises.length) {
                             if (firstWorkingServer) {
                                 console.log(`No servers with subtitles found, using fallback server ${firstWorkingServer.index}`);
@@ -522,9 +540,11 @@ async function ilovefeet(imdbId, isSeries = false, season = null, episode = null
             });
 
             selectedServer = await raceForSubtitles;
+
         } else {
             const serverPromises = serverList.map((serverObj, index) => testServer(serverObj, index));
             selectedServer = await Promise.any(serverPromises);
+
             console.log(`Found working server ${selectedServer.index} with format ${selectedServer.format}`);
         }
     } catch (error) {
@@ -532,10 +552,14 @@ async function ilovefeet(imdbId, isSeries = false, season = null, episode = null
         throw new Error('No working servers found');
     }
 
+    const workingServers = [selectedServer];
+
     if (preferredFormat === 'm3u8' && selectedServer.format === 'mpd') {
         selectedServer.data.url = selectedServer.data.url.replace('.mpd', '.m3u8');
         selectedServer.format = 'm3u8';
     }
+
+    let finalUrl = selectedServer.data.url;
 
     let englishSubtitles = null;
     try {
@@ -545,7 +569,11 @@ async function ilovefeet(imdbId, isSeries = false, season = null, episode = null
             );
             if (englishTrack) {
                 englishSubtitles = englishTrack.file;
+            } else {
+                console.log('No English subtitle track found in tracks array');
             }
+        } else {
+            console.log('No tracks array found in server response');
         }
     } catch (error) {
         console.log('Error extracting subtitles:' + error);
@@ -566,76 +594,5 @@ async function ilovefeet(imdbId, isSeries = false, season = null, episode = null
             selectedServerIndex: selectedServer.index,
             vFastServerIndex: vFastServer ? vFastServer.index : null
         }
-    };
-}
-
-// ======================== FALLBACK SCRAPER ========================
-async function scrapeStreamUrlDirect(pageText, baseUrl, headers, preferredFormat) {
-    console.log("Attempting direct stream extraction from page...");
-
-    // Patterns commonly found in vidfast pages
-    const streamPatterns = [
-        /file\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/i,
-        /src\s*=\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/i,
-        /player\.setup\s*\(\s*\{[^}]*file\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/i,
-        /[\"']?(https?:\/\/[^\"'\s]+\.m3u8[^\"'\s]*)[\"']?/i, // generic m3u8 URL
-    ];
-
-    let streamUrl = null;
-    for (const pattern of streamPatterns) {
-        const match = pageText.match(pattern);
-        if (match) {
-            streamUrl = match[1];
-            break;
-        }
-    }
-
-    if (!streamUrl) {
-        // Maybe it's an MPD
-        const mpdPatterns = [
-            /file\s*:\s*["'](https?:\/\/[^"']+\.mpd[^"']*)["']/i,
-            /src\s*=\s*["'](https?:\/\/[^"']+\.mpd[^"']*)["']/i,
-            /[\"']?(https?:\/\/[^\"'\s]+\.mpd[^\"'\s]*)[\"']?/i,
-        ];
-        for (const pattern of mpdPatterns) {
-            const match = pageText.match(pattern);
-            if (match) {
-                streamUrl = match[1];
-                break;
-            }
-        }
-    }
-
-    if (!streamUrl) {
-        console.error("Direct scraping failed. Page snippet: " + pageText.substring(0, 500));
-        throw new Error('No stream URL found in page fallback');
-    }
-
-    console.log("Direct scraped URL:", streamUrl);
-
-    // Try to find English subtitles in the page
-    let englishSubtitles = null;
-    const subPatterns = [
-        /tracks\s*:\s*\[\{[^}]*label\s*:\s*["']English["'][^}]*file\s*:\s*["'](https?:\/\/[^"']+)["']/i,
-        /["']label["']\s*:\s*["']English["'],\s*["']file["']\s*:\s*["'](https?:\/\/[^"']+)["']/i,
-    ];
-    for (const pattern of subPatterns) {
-        const subMatch = pageText.match(pattern);
-        if (subMatch) {
-            englishSubtitles = subMatch[1];
-            break;
-        }
-    }
-
-    // Return structure similar to the normal API response
-    return {
-        defaultUrl: streamUrl,
-        vFastUrl: null,
-        referer: baseUrl,
-        format: streamUrl.includes('.m3u8') ? 'm3u8' : 'mpd',
-        subtitles: englishSubtitles,
-        fullData: { url: streamUrl, tracks: englishSubtitles ? [{ label: 'English', file: englishSubtitles }] : [] },
-        vFastData: null,
-        serverStats: { total: 0, working: 1, failed: 0, selectedServerIndex: 0, vFastServerIndex: null, method: 'direct-scrape' }
     };
 }
